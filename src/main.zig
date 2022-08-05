@@ -13,8 +13,8 @@ frame_counter: usize,
 
 pub const App = @This();
 
-const WIDTH = 1024;
-const HEIGHT = 1024;
+const WIDTH = 640;
+const HEIGHT = 480;
 
 const SIZE = [_]u32{ WIDTH, HEIGHT };
 
