@@ -5,7 +5,6 @@ const gpu = @import("gpu");
 compute_pipeline: gpu.ComputePipeline,
 render_pipeline: gpu.RenderPipeline,
 sprite_vertex_buffer: gpu.Buffer,
-size_buffer: gpu.Buffer,
 cell_textures: [2]gpu.Texture,
 cell_bind_groups: [2]gpu.BindGroup,
 render_bind_groups: [2]gpu.BindGroup,
@@ -89,15 +88,6 @@ pub fn init(app: *App, core: *mach.Core) !void {
         cell.* = random.int(u1);
     }
 
-    const size_buffer: gpu.Buffer = core.device.createBuffer(&gpu.Buffer.Descriptor{
-        .usage = .{
-            .uniform = true,
-            .copy_dst = true,
-        },
-        .size = SIZE.len * @sizeOf(u32),
-    });
-    core.device.getQueue().writeBuffer(size_buffer, 0, u32, &SIZE);
-
     // Create the buffers that will represent the cells
     var cell_textures: [2]gpu.Texture = undefined;
     const cell_texture_size = gpu.Extent3D{ .width = WIDTH, .height = HEIGHT };
@@ -143,7 +133,6 @@ pub fn init(app: *App, core: *mach.Core) !void {
     app.compute_pipeline = compute_pipeline;
     app.render_pipeline = render_pipeline;
     app.sprite_vertex_buffer = sprite_vertex_buffer;
-    app.size_buffer = size_buffer;
     app.cell_textures = cell_textures;
     app.cell_bind_groups = cell_bind_groups;
     app.render_bind_groups = render_bind_groups;
