@@ -1,5 +1,3 @@
-/// A port of Austin Eng's "computeBoids" webgpu sample.
-/// https://github.com/austinEng/webgpu-samples/blob/main/src/sample/computeBoids/main.ts
 const std = @import("std");
 const mach = @import("mach");
 const gpu = @import("gpu");
@@ -7,55 +5,43 @@ const gpu = @import("gpu");
 compute_pipeline: gpu.ComputePipeline,
 render_pipeline: gpu.RenderPipeline,
 sprite_vertex_buffer: gpu.Buffer,
-particle_buffers: [2]gpu.Buffer,
-particle_bind_groups: [2]gpu.BindGroup,
-sim_param_buffer: gpu.Buffer,
+size_buffer: gpu.Buffer,
+cell_buffers: [2]gpu.Buffer,
+cell_bind_groups: [2]gpu.BindGroup,
+render_bind_group: gpu.BindGroup,
 frame_counter: usize,
 
 pub const App = @This();
 
-const num_particle = 1500;
+const WIDTH = 1024;
+const HEIGHT = 1024;
 
-var sim_params = [_]f32{
-    0.04, // .delta_T
-    0.1, // .rule_1_distance
-    0.025, // .rule_2_distance
-    0.025, // .rule_3_distance
-    0.02, // .rule_1_scale
-    0.05, // .rule_2_scale
-    0.005, // .rule_3_scale
-};
+const SIZE = [_]u32{ WIDTH, HEIGHT };
 
 pub fn init(app: *App, core: *mach.Core) !void {
     const sprite_shader_module = core.device.createShaderModule(&.{
-        .label = "sprite shader module",
-        .code = .{ .wgsl = @embedFile("sprite.wgsl") },
+        .label = "render cells shader module",
+        .code = .{ .wgsl = @embedFile("render_cells.wgsl") },
     });
 
-    const update_sprite_shader_module = core.device.createShaderModule(&.{
-        .label = "update sprite shader module",
-        .code = .{ .wgsl = @embedFile("updateSprites.wgsl") },
+    const update_cells_shader_module = core.device.createShaderModule(&.{
+        .label = "update cells shader module",
+        .code = .{ .wgsl = @embedFile("update_cells.wgsl") },
     });
 
-    const instanced_particles_attributes = [_]gpu.VertexAttribute{
+    const cell_buffer_attributes = [_]gpu.VertexAttribute{
         .{
-            // instance position
+            // vertex positions
             .shader_location = 0,
             .offset = 0,
-            .format = .float32x2,
-        },
-        .{
-            // instance velocity
-            .shader_location = 1,
-            .offset = 2 * 4,
-            .format = .float32x2,
+            .format = .uint32,
         },
     };
 
     const vertex_buffer_attributes = [_]gpu.VertexAttribute{
         .{
             // vertex positions
-            .shader_location = 2,
+            .shader_location = 1,
             .offset = 0,
             .format = .float32x2,
         },
@@ -67,15 +53,15 @@ pub fn init(app: *App, core: *mach.Core) !void {
             .entry_point = "vert_main",
             .buffers = &[_]gpu.VertexBufferLayout{
                 .{
-                    // instanced particles buffer
-                    .array_stride = 4 * 4,
+                    // cell buffer
+                    .array_stride = 1 * @sizeOf(u32),
                     .step_mode = .instance,
-                    .attribute_count = instanced_particles_attributes.len,
-                    .attributes = &instanced_particles_attributes,
+                    .attribute_count = cell_buffer_attributes.len,
+                    .attributes = &cell_buffer_attributes,
                 },
                 .{
                     // vertex buffer
-                    .array_stride = 2 * 4,
+                    .array_stride = 2 * @sizeOf(f32),
                     .step_mode = .vertex,
                     .attribute_count = vertex_buffer_attributes.len,
                     .attributes = &vertex_buffer_attributes,
@@ -90,13 +76,18 @@ pub fn init(app: *App, core: *mach.Core) !void {
     });
 
     const compute_pipeline = core.device.createComputePipeline(&gpu.ComputePipeline.Descriptor{ .compute = gpu.ProgrammableStageDescriptor{
-        .module = update_sprite_shader_module,
+        .module = update_cells_shader_module,
         .entry_point = "main",
     } });
 
     const vert_buffer_data = [_]f32{
-        -0.01, -0.02, 0.01,
-        -0.02, 0.0,   0.02,
+        0, 0,
+        1, 0,
+        0, 1,
+
+        1, 0,
+        1, 1,
+        0, 1,
     };
 
     const sprite_vertex_buffer = core.device.createBuffer(&gpu.Buffer.Descriptor{
@@ -105,53 +96,62 @@ pub fn init(app: *App, core: *mach.Core) !void {
     });
     core.device.getQueue().writeBuffer(sprite_vertex_buffer, 0, f32, &vert_buffer_data);
 
-    const sim_param_buffer = core.device.createBuffer(&gpu.Buffer.Descriptor{
-        .usage = .{ .uniform = true, .copy_dst = true },
-        .size = sim_params.len * @sizeOf(f32),
-    });
-    core.device.getQueue().writeBuffer(sim_param_buffer, 0, f32, &sim_params);
-
-    var initial_particle_data: [num_particle * 4]f32 = undefined;
+    // Create a buffer that initializes the cells to a random value
+    var initial_cell_data: [WIDTH * HEIGHT]u32 = undefined;
     var rng = std.rand.DefaultPrng.init(0);
     const random = rng.random();
-    var i: usize = 0;
-    while (i < num_particle) : (i += 1) {
-        initial_particle_data[4 * i + 0] = 2 * (random.float(f32) - 0.5);
-        initial_particle_data[4 * i + 1] = 2 * (random.float(f32) - 0.5);
-        initial_particle_data[4 * i + 2] = 2 * (random.float(f32) - 0.5) * 0.1;
-        initial_particle_data[4 * i + 3] = 2 * (random.float(f32) - 0.5) * 0.1;
+    for (initial_cell_data) |*cell| {
+        cell.* = random.int(u1);
     }
 
-    var particle_buffers: [2]gpu.Buffer = undefined;
-    var particle_bind_groups: [2]gpu.BindGroup = undefined;
-    i = 0;
-    while (i < 2) : (i += 1) {
-        particle_buffers[i] = core.device.createBuffer(&gpu.Buffer.Descriptor{
+    const size_buffer: gpu.Buffer = core.device.createBuffer(&gpu.Buffer.Descriptor{
+        .usage = .{
+            .uniform = true,
+            .copy_dst = true,
+        },
+        .size = SIZE.len * @sizeOf(u32),
+    });
+    core.device.getQueue().writeBuffer(size_buffer, 0, u32, &SIZE);
+
+    // Create the buffers that will represent the cells
+    var cell_buffers: [2]gpu.Buffer = undefined;
+    for (cell_buffers) |*buffer| {
+        buffer.* = core.device.createBuffer(&gpu.Buffer.Descriptor{
             .usage = .{
                 .vertex = true,
                 .copy_dst = true,
                 .storage = true,
             },
-            .size = initial_particle_data.len * @sizeOf(f32),
+            .size = initial_cell_data.len * @sizeOf(u32),
         });
-        core.device.getQueue().writeBuffer(particle_buffers[i], 0, f32, &initial_particle_data);
+        core.device.getQueue().writeBuffer(buffer.*, 0, u32, &initial_cell_data);
     }
 
-    i = 0;
-    while (i < 2) : (i += 1) {
-        particle_bind_groups[i] = core.device.createBindGroup(&gpu.BindGroup.Descriptor{ .layout = compute_pipeline.getBindGroupLayout(0), .entries = &[_]gpu.BindGroup.Entry{
-            gpu.BindGroup.Entry.buffer(0, sim_param_buffer, 0, sim_params.len * @sizeOf(f32)),
-            gpu.BindGroup.Entry.buffer(1, particle_buffers[i], 0, initial_particle_data.len * @sizeOf(f32)),
-            gpu.BindGroup.Entry.buffer(2, particle_buffers[(i + 1) % 2], 0, initial_particle_data.len * @sizeOf(f32)),
+    // Create 2 bind groups. The first bind group is { cell_buffers[0], cell_buffers[1] }, and the second is { cell_buffers[1], cell_buffers[0] }.
+    // This enables "double buffering" the cells when updating.
+    var cell_bind_groups: [2]gpu.BindGroup = undefined;
+    for (cell_bind_groups) |*bind_group, i| {
+        bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{ .layout = compute_pipeline.getBindGroupLayout(0), .entries = &[_]gpu.BindGroup.Entry{
+            gpu.BindGroup.Entry.buffer(0, size_buffer, 0, SIZE.len * @sizeOf(u32)),
+            gpu.BindGroup.Entry.buffer(1, cell_buffers[i], 0, initial_cell_data.len * @sizeOf(u32)),
+            gpu.BindGroup.Entry.buffer(2, cell_buffers[(i + 1) % 2], 0, initial_cell_data.len * @sizeOf(u32)),
         } });
     }
+
+    const render_bind_group = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
+        .layout = render_pipeline.getBindGroupLayout(0),
+        .entries = &[_]gpu.BindGroup.Entry{
+            gpu.BindGroup.Entry.buffer(0, size_buffer, 0, SIZE.len * @sizeOf(u32)),
+        },
+    });
 
     app.compute_pipeline = compute_pipeline;
     app.render_pipeline = render_pipeline;
     app.sprite_vertex_buffer = sprite_vertex_buffer;
-    app.particle_buffers = particle_buffers;
-    app.particle_bind_groups = particle_bind_groups;
-    app.sim_param_buffer = sim_param_buffer;
+    app.size_buffer = size_buffer;
+    app.cell_buffers = cell_buffers;
+    app.cell_bind_groups = cell_bind_groups;
+    app.render_bind_group = render_bind_group;
     app.frame_counter = 0;
 }
 
@@ -171,24 +171,22 @@ pub fn update(app: *App, core: *mach.Core) !void {
         color_attachment,
     } };
 
-    sim_params[0] = @floatCast(f32, core.delta_time);
-    core.device.getQueue().writeBuffer(app.sim_param_buffer, 0, f32, &sim_params);
-
     const command_encoder = core.device.createCommandEncoder(null);
     {
         const pass_encoder = command_encoder.beginComputePass(null);
         pass_encoder.setPipeline(app.compute_pipeline);
-        pass_encoder.setBindGroup(0, app.particle_bind_groups[app.frame_counter % 2], null);
-        pass_encoder.dispatch(@floatToInt(u32, @ceil(@as(f32, num_particle) / 64)), 1, 1);
+        pass_encoder.setBindGroup(0, app.cell_bind_groups[app.frame_counter % 2], null);
+        pass_encoder.dispatch(WIDTH, HEIGHT, 1);
         pass_encoder.end();
         pass_encoder.release();
     }
     {
         const pass_encoder = command_encoder.beginRenderPass(&render_pass_descriptor);
         pass_encoder.setPipeline(app.render_pipeline);
-        pass_encoder.setVertexBuffer(0, app.particle_buffers[(app.frame_counter + 1) % 2], 0, num_particle * 4 * @sizeOf(f32));
-        pass_encoder.setVertexBuffer(1, app.sprite_vertex_buffer, 0, 6 * @sizeOf(f32));
-        pass_encoder.draw(3, num_particle, 0, 0);
+        pass_encoder.setBindGroup(0, app.render_bind_group, null);
+        pass_encoder.setVertexBuffer(0, app.cell_buffers[(app.frame_counter + 1) % 2], 0, WIDTH * HEIGHT * @sizeOf(u32));
+        pass_encoder.setVertexBuffer(1, app.sprite_vertex_buffer, 0, 12 * @sizeOf(f32));
+        pass_encoder.draw(6, WIDTH * HEIGHT, 0, 0);
         pass_encoder.end();
         pass_encoder.release();
     }
