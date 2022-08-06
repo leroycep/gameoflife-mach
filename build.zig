@@ -31,10 +31,23 @@ pub fn build(b: *std.build.Builder) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
+    // Test binary
+    const tests = mach.App.init(b, .{
+        .name = "gameoflife-test",
+        .src = "src/test.zig",
+        .target = target,
+        .deps = &[_]std.build.Pkg{},
+    });
+    tests.setBuildMode(mode);
+    tests.link(.{});
+    tests.install();
 
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&exe_tests.step);
+    const test_cmd = tests.run();
+    test_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        test_cmd.addArgs(args);
+    }
+
+    const test_step = b.step("test", "Run the test binary");
+    test_step.dependOn(&test_cmd.step);
 }
