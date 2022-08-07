@@ -223,6 +223,32 @@ pub const tests = struct {
         }, &output);
     }
 
+    pub fn @"example: square is stable"(core: *mach.Core) !void {
+        const square = [4]@Vector(8, u1){
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .{ 0, 0, 0, 1, 1, 0, 0, 0 },
+            .{ 0, 0, 0, 1, 1, 0, 0, 0 },
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        try expectGrid(core, .{ 1, 1 }, &.{square}, &.{square});
+    }
+
+    pub fn @"example: line spins"(core: *mach.Core) !void {
+        const input = [4]@Vector(8, u1){
+            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const output = [4]@Vector(8, u1){
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .{ 1, 1, 1, 0, 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        try expectGrid(core, .{ 1, 1 }, &.{input}, &.{output});
+    }
+
     pub fn @"webgpu impl matches reference"(core: *mach.Core) !void {
         var rng = std.rand.DefaultPrng.init(0);
         const random = rng.random();
