@@ -247,97 +247,103 @@ pub const tests = struct {
         reference_impl_step(@intCast(@Vector(2, i32), size), cells_initial, cells_after);
 
         // Setup webgpu version
-        const tiles = try core.allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
-        defer core.allocator.free(tiles);
-        tilesFromU1Slice(size, cells_initial, tiles);
+        const tiles_initial = try core.allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
+        defer core.allocator.free(tiles_initial);
+        tilesFromU1Slice(size, cells_initial, tiles_initial);
 
         const tiles_expected = try core.allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
         defer core.allocator.free(tiles_expected);
         tilesFromU1Slice(size, cells_after, tiles_expected);
 
-        var world: World = undefined;
-        try world.init(core, size);
-        try world.set(core, tiles);
-
-        {
-            const command_encoder = core.device.createCommandEncoder(null);
-            try world.step(command_encoder);
-
-            const command = command_encoder.finish(null);
-            command_encoder.release();
-            core.device.getQueue().submit(&.{command});
-            command.release();
-        }
-
-        // download cells from gpu
-        {
-            // When copying a texture into a buffer, `bytes_per_row` *must* be a multiple of `256`.
-            // Here we do the math
-            const download_bytes_per_row = ((size_tiles[0] * @sizeOf(Tile) / 256) + 1) * 256;
-            const download = core.device.createBuffer(&.{
-                .size = download_bytes_per_row * size_tiles[1],
-                .usage = .{
-                    .copy_dst = true,
-                    .map_read = true,
-                },
-                .mapped_at_creation = false,
-            });
-
-            const download_copy_buffer_desc = gpu.ImageCopyBuffer{
-                .layout = .{
-                    .bytes_per_row = download_bytes_per_row,
-                    .rows_per_image = size_tiles[1],
-                },
-                .buffer = download,
-            };
-
-            const encoder = core.device.createCommandEncoder(&.{ .label = @src().fn_name });
-            encoder.copyTextureToBuffer(
-                &.{ .texture = world.cell_textures[world.generations % 2] },
-                &download_copy_buffer_desc,
-                &.{ .width = size_tiles[0], .height = size_tiles[1] },
-            );
-
-            const commands = encoder.finish(null);
-            encoder.release();
-
-            core.device.getQueue().submit(&.{commands});
-            commands.release();
-
-            std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
-            var ret_val: ?gpu.Buffer.MapAsyncStatus = null;
-            var callback = gpu.Buffer.MapCallback.init(*?gpu.Buffer.MapAsyncStatus, &ret_val, setStatusPtrCallback);
-            download.mapAsync(.read, 0, download_bytes_per_row * size_tiles[1], &callback);
-            while (true) {
-                if (ret_val == null) {
-                    core.device.tick();
-                } else {
-                    break;
-                }
-            }
-            std.debug.print("{s}:{} ret_val = {?}\n", .{ @src().fn_name, @src().line, ret_val });
-            defer download.unmap();
-            if (ret_val) |code| {
-                switch (code) {
-                    .success => {},
-                    else => |err| {
-                        std.log.err("Error downloading cell texture {}", .{err});
-                        return error.Download;
-                    },
-                }
-            }
-
-            std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
-            var y: u32 = 0;
-            while (y < size_tiles[1]) : (y += 1) {
-                errdefer std.debug.print("y = {}\n\n", .{y});
-                const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]);
-                try std.testing.expectEqualSlices(Tile, tiles_expected[0..size_tiles[0]], tiles_row);
-            }
-            std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
-        }
+        try expectGrid(core, size_tiles, tiles_expected, tiles_initial);
     }
 };
+
+pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected: []const Tile, tiles_initial: []const Tile) !void {
+    const size = size_tiles * TILE_SIZE;
+
+    var world: World = undefined;
+    try world.init(core, size);
+    try world.set(core, tiles_initial);
+
+    {
+        const command_encoder = core.device.createCommandEncoder(null);
+        try world.step(command_encoder);
+
+        const command = command_encoder.finish(null);
+        command_encoder.release();
+        core.device.getQueue().submit(&.{command});
+        command.release();
+    }
+
+    // download cells from gpu
+    {
+        // When copying a texture into a buffer, `bytes_per_row` *must* be a multiple of `256`.
+        // Here we do the math
+        const download_bytes_per_row = ((size_tiles[0] * @sizeOf(Tile) / 256) + 1) * 256;
+        const download = core.device.createBuffer(&.{
+            .size = download_bytes_per_row * size_tiles[1],
+            .usage = .{
+                .copy_dst = true,
+                .map_read = true,
+            },
+            .mapped_at_creation = false,
+        });
+
+        const download_copy_buffer_desc = gpu.ImageCopyBuffer{
+            .layout = .{
+                .bytes_per_row = download_bytes_per_row,
+                .rows_per_image = size_tiles[1],
+            },
+            .buffer = download,
+        };
+
+        const encoder = core.device.createCommandEncoder(&.{ .label = @src().fn_name });
+        encoder.copyTextureToBuffer(
+            &.{ .texture = world.cell_textures[world.generations % 2] },
+            &download_copy_buffer_desc,
+            &.{ .width = size_tiles[0], .height = size_tiles[1] },
+        );
+
+        const commands = encoder.finish(null);
+        encoder.release();
+
+        core.device.getQueue().submit(&.{commands});
+        commands.release();
+
+        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
+        var ret_val: ?gpu.Buffer.MapAsyncStatus = null;
+        var callback = gpu.Buffer.MapCallback.init(*?gpu.Buffer.MapAsyncStatus, &ret_val, setStatusPtrCallback);
+        download.mapAsync(.read, 0, download_bytes_per_row * size_tiles[1], &callback);
+        while (true) {
+            if (ret_val == null) {
+                core.device.tick();
+            } else {
+                break;
+            }
+        }
+        std.debug.print("{s}:{} ret_val = {?}\n", .{ @src().fn_name, @src().line, ret_val });
+        defer download.unmap();
+        if (ret_val) |code| {
+            switch (code) {
+                .success => {},
+                else => |err| {
+                    std.log.err("Error downloading cell texture {}", .{err});
+                    return error.Download;
+                },
+            }
+        }
+
+        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
+        var y: u32 = 0;
+        while (y < size_tiles[1]) : (y += 1) {
+            errdefer std.debug.print("y = {}\n\n", .{y});
+            const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]);
+            try std.testing.expectEqualSlices(Tile, tiles_expected[0..size_tiles[0]], tiles_row);
+        }
+        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
+    }
+}
 
 fn setStatusPtrCallback(status_ptr: *?gpu.Buffer.MapAsyncStatus, status: gpu.Buffer.MapAsyncStatus) void {
     status_ptr.* = status;
