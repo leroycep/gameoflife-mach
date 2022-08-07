@@ -8,15 +8,21 @@ sprite_vertex_buffer: gpu.Buffer,
 cell_textures: [2]gpu.Texture,
 cell_bind_groups: [2]gpu.BindGroup,
 render_bind_groups: [2]gpu.BindGroup,
+debug_texture: gpu.Texture,
+debug_bind_group: gpu.BindGroup,
 frame_counter: usize,
 
 pub const App = @This();
 
-const WIDTH = 640;
-const HEIGHT = 480;
+const WIDTH = 4;
+const HEIGHT = 8;
 
 const SIZE = [_]u32{ WIDTH, HEIGHT };
-const CellElemType = u32;
+const TileElemType = [4]u8;
+
+comptime {
+    std.debug.assert(@sizeOf(TileElemType) == 4);
+}
 
 pub fn init(app: *App, core: *mach.Core) !void {
     const sprite_shader_module = core.device.createShaderModule(&.{
@@ -26,7 +32,7 @@ pub fn init(app: *App, core: *mach.Core) !void {
 
     const update_cells_shader_module = core.device.createShaderModule(&.{
         .label = "update cells shader module",
-        .code = .{ .wgsl = @embedFile("update_cells.wgsl") },
+        .code = .{ .wgsl = @embedFile("update_cells_debug.wgsl") },
     });
 
     const vertex_buffer_attributes = [_]gpu.VertexAttribute{
@@ -81,11 +87,11 @@ pub fn init(app: *App, core: *mach.Core) !void {
     core.device.getQueue().writeBuffer(sprite_vertex_buffer, 0, f32, &vert_buffer_data);
 
     // Create a buffer that initializes the cells to a random value
-    var initial_cell_data: [WIDTH * HEIGHT]CellElemType = undefined;
+    var initial_cell_data: [WIDTH * HEIGHT]TileElemType = undefined;
     var rng = std.rand.DefaultPrng.init(0);
     const random = rng.random();
     for (initial_cell_data) |*cell| {
-        cell.* = random.int(u1);
+        random.bytes(std.mem.asBytes(cell));
     }
 
     // Create the buffers that will represent the cells
@@ -93,7 +99,7 @@ pub fn init(app: *App, core: *mach.Core) !void {
     const cell_texture_size = gpu.Extent3D{ .width = WIDTH, .height = HEIGHT };
     for (cell_textures) |*texture| {
         texture.* = core.device.createTexture(&gpu.Texture.Descriptor{
-            .format = .r32_uint,
+            .format = .rgba8_uint,
             .usage = .{
                 .copy_dst = true,
                 .storage_binding = true,
@@ -103,22 +109,56 @@ pub fn init(app: *App, core: *mach.Core) !void {
         });
         core.device.getQueue().writeTexture(
             &.{ .texture = texture.* },
-            &.{ .bytes_per_row = WIDTH * @sizeOf(CellElemType), .rows_per_image = HEIGHT },
+            &.{ .bytes_per_row = WIDTH * @sizeOf(TileElemType), .rows_per_image = HEIGHT },
             &cell_texture_size,
-            CellElemType,
+            TileElemType,
             &initial_cell_data,
         );
     }
+
+    const debug_texture_size = gpu.Extent3D{ .width = WIDTH * 8, .height = HEIGHT * 4 };
+    const debug_texture = core.device.createTexture(&gpu.Texture.Descriptor{
+        .format = .rgba8_uint,
+        .usage = .{
+            .copy_dst = true,
+            .storage_binding = true,
+            .texture_binding = true,
+        },
+        .size = debug_texture_size,
+    });
+    core.device.getQueue().writeTexture(
+        &.{ .texture = debug_texture },
+        &.{ .bytes_per_row = WIDTH * 8 * 4, .rows_per_image = HEIGHT * 4 },
+        &debug_texture_size,
+        [4]u8,
+        &([_][4]u8{.{ 0, 0, 0, 0 }} ** (WIDTH * 8 * HEIGHT * 4)),
+    );
+
+    std.log.debug("{s}:{}", .{ @src().fn_name, @src().line });
 
     // Create 2 bind groups. The first bind group is { cell_buffers[0], cell_buffers[1] }, and the second is { cell_buffers[1], cell_buffers[0] }.
     // This enables "double buffering" the cells when updating.
     var cell_bind_groups: [2]gpu.BindGroup = undefined;
     for (cell_bind_groups) |*bind_group, i| {
-        bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{ .layout = compute_pipeline.getBindGroupLayout(0), .entries = &[_]gpu.BindGroup.Entry{
-            gpu.BindGroup.Entry.textureView(0, cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
-            gpu.BindGroup.Entry.textureView(1, cell_textures[(i + 1) % 2].createView(&gpu.TextureView.Descriptor{})),
-        } });
+        std.log.debug("{s}:{} {}", .{ @src().fn_name, @src().line, compute_pipeline.getBindGroupLayout(0) });
+        bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
+            .layout = compute_pipeline.getBindGroupLayout(0),
+            .entries = &[_]gpu.BindGroup.Entry{
+                gpu.BindGroup.Entry.textureView(0, cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
+                gpu.BindGroup.Entry.textureView(1, cell_textures[(i + 1) % 2].createView(&gpu.TextureView.Descriptor{})),
+            },
+        });
     }
+
+    const debug_bind_group = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
+        .layout = compute_pipeline.getBindGroupLayout(1),
+        .entries = &[_]gpu.BindGroup.Entry{
+            gpu.BindGroup.Entry.textureView(0, debug_texture.createView(&gpu.TextureView.Descriptor{})),
+        },
+    });
+    _ = debug_bind_group;
+
+    std.log.debug("{s}:{}", .{ @src().fn_name, @src().line });
 
     var render_bind_groups: [2]gpu.BindGroup = undefined;
     for (render_bind_groups) |*bind_group, i| {
@@ -126,6 +166,7 @@ pub fn init(app: *App, core: *mach.Core) !void {
             .layout = render_pipeline.getBindGroupLayout(0),
             .entries = &[_]gpu.BindGroup.Entry{
                 gpu.BindGroup.Entry.textureView(0, cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
+                gpu.BindGroup.Entry.textureView(1, debug_texture.createView(&gpu.TextureView.Descriptor{})),
             },
         });
     }
@@ -136,6 +177,8 @@ pub fn init(app: *App, core: *mach.Core) !void {
     app.cell_textures = cell_textures;
     app.cell_bind_groups = cell_bind_groups;
     app.render_bind_groups = render_bind_groups;
+    app.debug_texture = debug_texture;
+    app.debug_bind_group = debug_bind_group;
     app.frame_counter = 0;
 }
 
@@ -156,10 +199,12 @@ pub fn update(app: *App, core: *mach.Core) !void {
     } };
 
     const command_encoder = core.device.createCommandEncoder(null);
+    var steps = app.frame_counter / 100;
     {
         const pass_encoder = command_encoder.beginComputePass(null);
         pass_encoder.setPipeline(app.compute_pipeline);
-        pass_encoder.setBindGroup(0, app.cell_bind_groups[app.frame_counter % 2], null);
+        pass_encoder.setBindGroup(0, app.cell_bind_groups[steps % 2], null);
+        pass_encoder.setBindGroup(1, app.debug_bind_group, null);
         pass_encoder.dispatch(WIDTH, HEIGHT, 1);
         pass_encoder.end();
         pass_encoder.release();
@@ -167,7 +212,7 @@ pub fn update(app: *App, core: *mach.Core) !void {
     {
         const pass_encoder = command_encoder.beginRenderPass(&render_pass_descriptor);
         pass_encoder.setPipeline(app.render_pipeline);
-        pass_encoder.setBindGroup(0, app.render_bind_groups[(app.frame_counter + 1) % 2], null);
+        pass_encoder.setBindGroup(0, app.render_bind_groups[steps % 2], null);
         pass_encoder.setVertexBuffer(0, app.sprite_vertex_buffer, 0, 12 * @sizeOf(f32));
         pass_encoder.draw(6, 1, 0, 0);
         pass_encoder.end();

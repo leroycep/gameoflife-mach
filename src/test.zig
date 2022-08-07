@@ -11,11 +11,16 @@ const HEIGHT = 8;
 
 pub fn init(app: *App, core: *mach.Core) !void {
     _ = app;
+    _ = core;
+}
 
+pub fn deinit(_: *App, _: *mach.Core) void {}
+
+pub fn update(_: *App, core: *mach.Core) !void {
     inline for (@typeInfo(world.tests).Struct.decls) |decl, i| {
         std.debug.print("Running world.tests[{}] {s}...", .{ i, decl.name });
         const func = @field(world.tests, decl.name);
-        const result = func();
+        const result = func(core);
         if (result) |_| {
             std.debug.print("PASS\n", .{});
         } else |err| {
@@ -28,10 +33,6 @@ pub fn init(app: *App, core: *mach.Core) !void {
 
     core.setShouldClose(true);
 }
-
-pub fn deinit(_: *App, _: *mach.Core) void {}
-
-pub fn update(_: *App, _: *mach.Core) !void {}
 
 comptime {
     _ = world;

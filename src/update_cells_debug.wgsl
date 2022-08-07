@@ -1,5 +1,6 @@
 @binding(0) @group(0) var cellsA : texture_2d<u32>;
 @binding(1) @group(0) var cellsB : texture_storage_2d<rgba8uint, write>;
+@binding(0) @group(1) var debug : texture_storage_2d<rgba8uint, write>;
 
 var<workgroup> new_tile: array<array<bool, 8>, 4>;
 
@@ -25,6 +26,7 @@ fn main(
         }
     }
 
+
     var neighbors: u32 = 0u;
     var prev_value = false;
     for (var i = 0; i < 3; i += 1) {
@@ -40,7 +42,7 @@ fn main(
             }
         }
     }
-
+    
     switch (neighbors) {
         case 2u: {
             new_tile[local_pos.y][local_pos.x] = prev_value;
@@ -53,6 +55,12 @@ fn main(
         }
         default: { }
     }
+
+    let grow = (!prev_value) && new_tile[local_pos.y][local_pos.x];
+    let die = prev_value && !new_tile[local_pos.y][local_pos.x];
+    let green = u32(grow) * 255u;
+    let red = u32(die) * 255u;
+    textureStore(debug, texel_pos * TILE_SIZE + local_pos, vec4<u32>(red,green,neighbors * 64u,255u));
 
     workgroupBarrier();
     
