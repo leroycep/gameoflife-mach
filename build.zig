@@ -1,5 +1,6 @@
 const std = @import("std");
-const mach = @import("libs/mach/build.zig");
+const zgpu = @import("libs/zgpu/build.zig");
+const zpool = @import("libs/zpool/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     // Standard target options allows the person running `zig build` to choose
@@ -12,34 +13,15 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const app = mach.App.init(b, .{
-        .name = "gameoflife",
-        .src = "src/main.zig",
-        .target = target,
-        .deps = &[_]std.build.Pkg{},
-    });
-    app.setBuildMode(mode);
-    app.link(.{});
-    app.install();
-
-    const run_cmd = app.run();
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    const zgpu_options = zgpu.BuildOptionsStep.init(b, .{ .dawn = .{ .from_source = false } });
+    const zgpu_pkg = zgpu.getPkg(&.{ zgpu_options.getPkg(), zpool.pkg });
 
     // Test binary
-    const tests = mach.App.init(b, .{
-        .name = "gameoflife-test",
-        .src = "src/test.zig",
-        .target = target,
-        .deps = &[_]std.build.Pkg{},
-    });
+    const tests = b.addExecutable("gameoflife-test", "src/test.zig");
+    tests.setTarget(target);
     tests.setBuildMode(mode);
-    tests.link(.{});
+    tests.addPackage(zgpu_pkg);
+    zgpu.link(tests, zgpu_options);
     tests.install();
 
     const test_cmd = tests.run();

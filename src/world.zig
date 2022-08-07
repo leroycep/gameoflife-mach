@@ -1,12 +1,13 @@
 const std = @import("std");
-const mach = @import("mach");
-const gpu = @import("gpu");
+const zgpu = @import("zgpu");
+const wgpu = zgpu.wgpu;
 
 size: @Vector(2, u32),
 generations: u64,
-compute_pipeline: gpu.ComputePipeline,
-cell_textures: [2]gpu.Texture,
-cell_bind_groups: [2]gpu.BindGroup,
+gctx: *zgpu.GraphicsContext,
+compute_pipeline: zgpu.ComputePipelineHandle,
+cell_textures: [2]zgpu.TextureHandle,
+cell_bind_groups: [2]zgpu.BindGroupHandle,
 
 const World = @This();
 
@@ -18,63 +19,76 @@ comptime {
     std.debug.assert(@sizeOf(Tile) == 4);
 }
 
-pub fn init(this: *@This(), core: *mach.Core, size: @Vector(2, u32)) !void {
+pub fn init(this: *@This(), gctx: *zgpu.GraphicsContext, size: @Vector(2, u32)) !void {
     if (size[0] % TILE_SIZE[0] != 0 or size[1] % TILE_SIZE[1] != 0) {
         return error.MultipleOfTileSize;
     }
 
-    const update_cells_shader_module = core.device.createShaderModule(&.{
-        .label = "update cells shader module",
-        .code = .{ .wgsl = @embedFile("update_cells.wgsl") },
-    });
+    const update_cells_shader_module = zgpu.util.createWgslShaderModule(gctx.device, @embedFile("update_cells.wgsl"), "compute update cells");
+    defer update_cells_shader_module.release();
 
-    const compute_pipeline = core.device.createComputePipeline(&gpu.ComputePipeline.Descriptor{ .compute = gpu.ProgrammableStageDescriptor{
+    const compute_pipeline_layout = gctx.createPipelineLayout(&.{});
+
+    const compute_pipeline_descriptor = wgpu.ComputePipelineDescriptor{ .compute = wgpu.ProgrammableStageDescriptor{
         .module = update_cells_shader_module,
         .entry_point = "main",
-    } });
+    } };
+
+    const compute_pipeline = gctx.createComputePipeline(compute_pipeline_layout, compute_pipeline_descriptor);
 
     // Create the buffers that will represent the cells
-    var cell_textures: [2]gpu.Texture = undefined;
-    const cell_texture_size = gpu.Extent3D{
+    const cell_texture_size = wgpu.Extent3D{
         .width = size[0],
         .height = size[1],
     };
-    for (cell_textures) |*texture| {
-        texture.* = core.device.createTexture(&gpu.Texture.Descriptor{
-            .format = .rgba8_uint,
-            .usage = .{
-                .copy_src = true,
-                .copy_dst = true,
-                .storage_binding = true,
-                .texture_binding = true,
-            },
-            .size = cell_texture_size,
-        });
-    }
+    const cell_texture_descriptor = wgpu.TextureDescriptor{
+        .format = .rgba8_uint,
+        .usage = .{
+            .copy_src = true,
+            .copy_dst = true,
+            .storage_binding = true,
+            .texture_binding = true,
+        },
+        .size = cell_texture_size,
+    };
+
+    var cell_textures = [2]zgpu.TextureHandle{
+        gctx.createTexture(cell_texture_descriptor),
+        gctx.createTexture(cell_texture_descriptor),
+    };
+
+    const cell_texture_views = [2]zgpu.TextureViewHandle{
+        gctx.createTextureView(cell_textures[0], .{}),
+        gctx.createTextureView(cell_textures[1], .{}),
+    };
 
     // Create 2 bind groups. The first bind group is { cell_buffers[0], cell_buffers[1] }, and the second is { cell_buffers[1], cell_buffers[0] }.
     // This enables "double buffering" the cells when updating.
-    var cell_bind_groups: [2]gpu.BindGroup = undefined;
+    const bind_group_layout = gctx.createBindGroupLayout(&.{
+        zgpu.bglTexture(0, .{ .compute = true }, .uint, .tvdim_2d, false),
+        zgpu.bglStorageTexture(1, .{ .compute = true }, .write_only, .rgba8_uint, .tvdim_2d),
+    });
+
+    defer gctx.releaseResource(bind_group_layout);
+    var cell_bind_groups: [2]zgpu.BindGroupHandle = undefined;
     for (cell_bind_groups) |*bind_group, i| {
-        bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
-            .layout = compute_pipeline.getBindGroupLayout(0),
-            .entries = &[_]gpu.BindGroup.Entry{
-                gpu.BindGroup.Entry.textureView(0, cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
-                gpu.BindGroup.Entry.textureView(1, cell_textures[(i + 1) % 2].createView(&gpu.TextureView.Descriptor{})),
-            },
+        bind_group.* = gctx.createBindGroup(bind_group_layout, &.{
+            .{ .binding = 0, .texture_view_handle = cell_texture_views[i] },
+            .{ .binding = 0, .texture_view_handle = cell_texture_views[(i + 1) % 2] },
         });
     }
 
     this.* = .{
         .size = size,
         .generations = 0,
+        .gctx = gctx,
         .compute_pipeline = compute_pipeline,
         .cell_textures = cell_textures,
         .cell_bind_groups = cell_bind_groups,
     };
 }
 
-pub fn deinit(_: *@This(), _: *mach.Core) void {}
+pub fn deinit(_: *@This(), _: *zgpu.GraphicsContext) void {}
 
 pub fn tilesFromU1Slice(size: @Vector(2, u32), src: []const u1, out: []Tile) void {
     std.debug.assert(src.len == size[0] * size[1]);
@@ -99,29 +113,29 @@ pub fn tilesFromU1Slice(size: @Vector(2, u32), src: []const u1, out: []Tile) voi
     }
 }
 
-pub fn set(this: *@This(), core: *mach.Core, src: []const Tile) !void {
+pub fn set(this: *@This(), src: []const Tile) !void {
     const texture_size = @divExact(this.size, TILE_SIZE);
     std.debug.assert(src.len == texture_size[0] * texture_size[1]);
 
-    const texture_extents = gpu.Extent3D{ .width = texture_size[0], .height = texture_size[1] };
-    core.device.getQueue().writeTexture(
-        &.{ .texture = this.cell_textures[this.generations % 2] },
-        &.{
+    const texture_extents = wgpu.Extent3D{ .width = texture_size[0], .height = texture_size[1] };
+    this.gctx.queue.writeTexture(
+        .{ .texture = this.gctx.lookupResource(this.cell_textures[this.generations % 2]).? },
+        .{
             .bytes_per_row = texture_size[0] * @sizeOf(Tile),
             .rows_per_image = texture_size[1],
         },
-        &texture_extents,
+        texture_extents,
         Tile,
         src,
     );
 }
 
-pub fn get(this: *@This(), core: *mach.Core) void {
+pub fn get(this: *@This(), gctx: *zgpu.GraphicsContext) void {
     const texture_size = @divExact(this.size, TILE_SIZE);
 
     comptime std.debug.assert(@sizeOf(@Vector(8, u1)) == 1);
 
-    const download = core.device.createBuffer(&.{
+    const download = gctx.createBuffer(&.{
         .size = texture_size[0] * texture_size[1] * @sizeOf(Tile),
         .usage = .{
             .copy_dst = true,
@@ -130,22 +144,22 @@ pub fn get(this: *@This(), core: *mach.Core) void {
         .mapped_at_creation = false,
     });
     //gpu.Buffer.MapCallback.init(void, {}, textureReadCallback);
-    const encoder = core.device.createCommandEncoder(&.{ .label = @src().fn_name });
+    const encoder = gctx.createCommandEncoder(&.{ .label = @src().fn_name });
     encoder.copyTextureToBuffer(this.cell_textures[(this.generations + 1) % 2], &download);
 
     const commands = encoder.finish();
     encoder.release();
 
-    core.device.getQueue().submit(commands);
+    gctx.queue.submit(commands);
     commands.release();
 
     download.mapAsync();
 }
 
-pub fn step(this: *@This(), command_encoder: gpu.CommandEncoder) !void {
+pub fn step(this: *@This(), command_encoder: wgpu.CommandEncoder) !void {
     const pass_encoder = command_encoder.beginComputePass(null);
-    pass_encoder.setPipeline(this.compute_pipeline);
-    pass_encoder.setBindGroup(0, this.cell_bind_groups[this.generations % 2], null);
+    pass_encoder.setPipeline(this.gctx.lookupResource(this.compute_pipeline).?);
+    pass_encoder.setBindGroup(0, this.gctx.lookupResource(this.cell_bind_groups[this.generations % 2]).?, null);
     pass_encoder.dispatch(this.size[0], this.size[1], 1);
     pass_encoder.end();
     pass_encoder.release();
@@ -194,7 +208,7 @@ fn reference_impl_step(size: @Vector(2, i32), cellsIn: []const u1, cellsOut: []u
 }
 
 pub const tests = struct {
-    pub fn @"reference example: square is stable"(_: *mach.Core) !void {
+    pub fn @"reference example: square is stable"(_: std.mem.Allocator, _: *zgpu.GraphicsContext) !void {
         const size = @Vector(2, i32){ 4, 4 };
         const input = &[_]u1{
             0, 0, 0, 0,
@@ -207,7 +221,7 @@ pub const tests = struct {
         try std.testing.expectEqualSlices(u1, input, &output);
     }
 
-    pub fn @"reference example: line spins"(_: *mach.Core) !void {
+    pub fn @"reference example: line spins"(_: std.mem.Allocator, _: *zgpu.GraphicsContext) !void {
         const size = @Vector(2, i32){ 3, 3 };
         const input = &[_]u1{
             0, 0, 0,
@@ -223,17 +237,17 @@ pub const tests = struct {
         }, &output);
     }
 
-    pub fn @"example: square is stable"(core: *mach.Core) !void {
+    pub fn @"example: square is stable"(_: std.mem.Allocator, gctx: *zgpu.GraphicsContext) !void {
         const square = [4]@Vector(8, u1){
             .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .{ 0, 0, 0, 1, 1, 0, 0, 0 },
             .{ 0, 0, 0, 1, 1, 0, 0, 0 },
             .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
-        try expectGrid(core, .{ 1, 1 }, &.{square}, &.{square});
+        try expectGrid(gctx, .{ 1, 1 }, &.{square}, &.{square});
     }
 
-    pub fn @"example: line spins"(core: *mach.Core) !void {
+    pub fn @"example: line spins"(_: std.mem.Allocator, gctx: *zgpu.GraphicsContext) !void {
         const input = [4]@Vector(8, u1){
             .{ 0, 1, 0, 0, 0, 0, 0, 0 },
             .{ 0, 1, 0, 0, 0, 0, 0, 0 },
@@ -246,10 +260,10 @@ pub const tests = struct {
             .{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
-        try expectGrid(core, .{ 1, 1 }, &.{input}, &.{output});
+        try expectGrid(gctx, .{ 1, 1 }, &.{input}, &.{output});
     }
 
-    pub fn @"webgpu impl matches reference"(core: *mach.Core) !void {
+    pub fn @"webgpu impl matches reference"(allocator: std.mem.Allocator, gctx: *zgpu.GraphicsContext) !void {
         var rng = std.rand.DefaultPrng.init(0);
         const random = rng.random();
 
@@ -261,44 +275,44 @@ pub const tests = struct {
         const size = size_tiles * TILE_SIZE;
 
         // Generate initial grid
-        const cells_initial = try core.allocator.alloc(u1, @intCast(usize, size[0] * size[1]));
-        defer core.allocator.free(cells_initial);
+        const cells_initial = try allocator.alloc(u1, @intCast(usize, size[0] * size[1]));
+        defer allocator.free(cells_initial);
         for (cells_initial) |*cell| {
             cell.* = random.int(u1);
         }
 
         // Run reference implementation
-        const cells_after = try core.allocator.alloc(u1, @intCast(usize, size[0] * size[1]));
-        defer core.allocator.free(cells_after);
+        const cells_after = try allocator.alloc(u1, @intCast(usize, size[0] * size[1]));
+        defer allocator.free(cells_after);
         reference_impl_step(@intCast(@Vector(2, i32), size), cells_initial, cells_after);
 
         // Setup webgpu version
-        const tiles_initial = try core.allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
-        defer core.allocator.free(tiles_initial);
+        const tiles_initial = try allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
+        defer allocator.free(tiles_initial);
         tilesFromU1Slice(size, cells_initial, tiles_initial);
 
-        const tiles_expected = try core.allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
-        defer core.allocator.free(tiles_expected);
+        const tiles_expected = try allocator.alloc(Tile, @intCast(usize, size_tiles[0] * size_tiles[1]));
+        defer allocator.free(tiles_expected);
         tilesFromU1Slice(size, cells_after, tiles_expected);
 
-        try expectGrid(core, size_tiles, tiles_expected, tiles_initial);
+        try expectGrid(gctx, size_tiles, tiles_expected, tiles_initial);
     }
 };
 
-pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected: []const Tile, tiles_initial: []const Tile) !void {
+pub fn expectGrid(gctx: *zgpu.GraphicsContext, size_tiles: @Vector(2, u32), tiles_expected: []const Tile, tiles_initial: []const Tile) !void {
     const size = size_tiles * TILE_SIZE;
 
     var world: World = undefined;
-    try world.init(core, size);
-    try world.set(core, tiles_initial);
+    try world.init(gctx, size);
+    try world.set(tiles_initial);
 
     {
-        const command_encoder = core.device.createCommandEncoder(null);
+        const command_encoder = gctx.device.createCommandEncoder(null);
         try world.step(command_encoder);
 
         const command = command_encoder.finish(null);
         command_encoder.release();
-        core.device.getQueue().submit(&.{command});
+        gctx.queue.submit(&.{command});
         command.release();
     }
 
@@ -307,7 +321,7 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
         // When copying a texture into a buffer, `bytes_per_row` *must* be a multiple of `256`.
         // Here we do the math
         const download_bytes_per_row = ((size_tiles[0] * @sizeOf(Tile) / 256) + 1) * 256;
-        const download = core.device.createBuffer(&.{
+        const download = gctx.createBuffer(.{
             .size = download_bytes_per_row * size_tiles[1],
             .usage = .{
                 .copy_dst = true,
@@ -316,40 +330,39 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
             .mapped_at_creation = false,
         });
 
-        const download_copy_buffer_desc = gpu.ImageCopyBuffer{
+        const download_copy_buffer_desc = wgpu.ImageCopyBuffer{
             .layout = .{
                 .bytes_per_row = download_bytes_per_row,
                 .rows_per_image = size_tiles[1],
             },
-            .buffer = download,
+            .buffer = gctx.lookupResource(download).?,
         };
 
-        const encoder = core.device.createCommandEncoder(&.{ .label = @src().fn_name });
+        const encoder = gctx.device.createCommandEncoder(wgpu.CommandEncoderDescriptor{ .label = @src().fn_name });
         encoder.copyTextureToBuffer(
-            &.{ .texture = world.cell_textures[world.generations % 2] },
-            &download_copy_buffer_desc,
-            &.{ .width = size_tiles[0], .height = size_tiles[1] },
+            .{ .texture = gctx.lookupResource(world.cell_textures[world.generations % 2]).? },
+            download_copy_buffer_desc,
+            .{ .width = size_tiles[0], .height = size_tiles[1] },
         );
 
         const commands = encoder.finish(null);
         encoder.release();
 
-        core.device.getQueue().submit(&.{commands});
+        gctx.queue.submit(&.{commands});
         commands.release();
 
         std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
-        var ret_val: ?gpu.Buffer.MapAsyncStatus = null;
-        var callback = gpu.Buffer.MapCallback.init(*?gpu.Buffer.MapAsyncStatus, &ret_val, setStatusPtrCallback);
-        download.mapAsync(.read, 0, download_bytes_per_row * size_tiles[1], &callback);
+        var ret_val: ?wgpu.BufferMapAsyncStatus = null;
+        gctx.lookupResource(download).?.mapAsync(.{ .read = true }, 0, download_bytes_per_row * size_tiles[1], setStatusPtrCallback, &ret_val);
         while (true) {
             if (ret_val == null) {
-                core.device.tick();
+                gctx.device.tick();
             } else {
                 break;
             }
         }
         std.debug.print("{s}:{} ret_val = {?}\n", .{ @src().fn_name, @src().line, ret_val });
-        defer download.unmap();
+        defer gctx.lookupResource(download).?.unmap();
         if (ret_val) |code| {
             switch (code) {
                 .success => {},
@@ -364,13 +377,14 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
         var y: u32 = 0;
         while (y < size_tiles[1]) : (y += 1) {
             errdefer std.debug.print("y = {}\n\n", .{y});
-            const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]);
+            const tiles_row = gctx.lookupResource(download).?.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]).?;
             try std.testing.expectEqualSlices(Tile, tiles_expected[0..size_tiles[0]], tiles_row);
         }
         std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
     }
 }
 
-fn setStatusPtrCallback(status_ptr: *?gpu.Buffer.MapAsyncStatus, status: gpu.Buffer.MapAsyncStatus) void {
+fn setStatusPtrCallback(status: wgpu.BufferMapAsyncStatus, userdata: ?*anyopaque) callconv(.C) void {
+    const status_ptr = @ptrCast(*?wgpu.BufferMapAsyncStatus, @alignCast(@alignOf(*?wgpu.BufferMapAsyncStatus), userdata.?));
     status_ptr.* = status;
 }
