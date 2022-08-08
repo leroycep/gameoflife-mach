@@ -2,7 +2,7 @@ const std = @import("std");
 const mach = @import("mach");
 const gpu = @import("gpu");
 
-size: @Vector(2, u32),
+texture_size: @Vector(2, u32),
 generations: u64,
 compute_pipeline: gpu.ComputePipeline,
 cell_textures: [2]gpu.Texture,
@@ -11,18 +11,14 @@ cell_bind_groups: [2]gpu.BindGroup,
 const World = @This();
 
 pub const TILE_SIZE = @Vector(2, u32){ 8, 4 };
-const Tile = [4]@Vector(8, u1);
+pub const Tile = [4]u8;
 
 comptime {
     std.debug.assert(@sizeOf(@Vector(8, u1)) == 1);
     std.debug.assert(@sizeOf(Tile) == 4);
 }
 
-pub fn init(this: *@This(), core: *mach.Core, size: @Vector(2, u32)) !void {
-    if (size[0] % TILE_SIZE[0] != 0 or size[1] % TILE_SIZE[1] != 0) {
-        return error.MultipleOfTileSize;
-    }
-
+pub fn init(this: *@This(), core: *mach.Core, texture_size: @Vector(2, u32)) !void {
     const update_cells_shader_module = core.device.createShaderModule(&.{
         .label = "update cells shader module",
         .code = .{ .wgsl = @embedFile("update_cells.wgsl") },
@@ -36,8 +32,8 @@ pub fn init(this: *@This(), core: *mach.Core, size: @Vector(2, u32)) !void {
     // Create the buffers that will represent the cells
     var cell_textures: [2]gpu.Texture = undefined;
     const cell_texture_size = gpu.Extent3D{
-        .width = size[0],
-        .height = size[1],
+        .width = texture_size[0],
+        .height = texture_size[1],
     };
     for (cell_textures) |*texture| {
         texture.* = core.device.createTexture(&gpu.Texture.Descriptor{
@@ -66,7 +62,7 @@ pub fn init(this: *@This(), core: *mach.Core, size: @Vector(2, u32)) !void {
     }
 
     this.* = .{
-        .size = size,
+        .texture_size = texture_size,
         .generations = 0,
         .compute_pipeline = compute_pipeline,
         .cell_textures = cell_textures,
@@ -93,22 +89,25 @@ pub fn tilesFromU1Slice(size: @Vector(2, u32), src: []const u1, out: []Tile) voi
             while (row < TILE_SIZE[1]) : (row += 1) {
                 const src_pos = texel_pos * TILE_SIZE + @Vector(2, u32){ 0, row };
                 const src_idx = @intCast(u32, src_pos[1] * size[0] + src_pos[0]);
-                out[texel_idx][row] = src[src_idx..][0..TILE_SIZE[0]].*;
+                out[texel_idx][row] = 0;
+                var i: usize = 0;
+                while (i < 8) : (i += 1) {
+                    out[texel_idx][row] = (out[texel_idx][row] << 1) | src[src_idx..][i];
+                }
             }
         }
     }
 }
 
 pub fn set(this: *@This(), core: *mach.Core, src: []const Tile) !void {
-    const texture_size = @divExact(this.size, TILE_SIZE);
-    std.debug.assert(src.len == texture_size[0] * texture_size[1]);
+    std.debug.assert(src.len == this.texture_size[0] * this.texture_size[1]);
 
-    const texture_extents = gpu.Extent3D{ .width = texture_size[0], .height = texture_size[1] };
+    const texture_extents = gpu.Extent3D{ .width = this.texture_size[0], .height = this.texture_size[1] };
     core.device.getQueue().writeTexture(
         &.{ .texture = this.cell_textures[this.generations % 2] },
         &.{
-            .bytes_per_row = texture_size[0] * @sizeOf(Tile),
-            .rows_per_image = texture_size[1],
+            .bytes_per_row = this.texture_size[0] * @sizeOf(Tile),
+            .rows_per_image = this.texture_size[1],
         },
         &texture_extents,
         Tile,
@@ -146,7 +145,7 @@ pub fn step(this: *@This(), command_encoder: gpu.CommandEncoder) !void {
     const pass_encoder = command_encoder.beginComputePass(null);
     pass_encoder.setPipeline(this.compute_pipeline);
     pass_encoder.setBindGroup(0, this.cell_bind_groups[this.generations % 2], null);
-    pass_encoder.dispatch(this.size[0], this.size[1], 1);
+    pass_encoder.dispatch(this.texture_size[0], this.texture_size[1], 1);
     pass_encoder.end();
     pass_encoder.release();
     this.generations += 1;
@@ -223,30 +222,64 @@ pub const tests = struct {
         }, &output);
     }
 
+    pub fn @"reference example: full 8x4 grid"(_: *mach.Core) !void {
+        const size = @Vector(2, i32){ 8, 4 };
+        const input = &[_]u1{
+            1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1,
+        };
+        var output: [input.len]u1 = undefined;
+        reference_impl_step(size, input, &output);
+        try std.testing.expectEqualSlices(u1, &[_]u1{
+            1, 0, 0, 0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            1, 0, 0, 0, 0, 0, 0, 1,
+        }, &output);
+    }
+
     pub fn @"example: square is stable"(core: *mach.Core) !void {
-        const square = [4]@Vector(8, u1){
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .{ 0, 0, 0, 1, 1, 0, 0, 0 },
-            .{ 0, 0, 0, 1, 1, 0, 0, 0 },
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        const square = Tile{
+            0b000_00_000,
+            0b000_11_000,
+            0b000_11_000,
+            0b000_00_000,
         };
         try expectGrid(core, .{ 1, 1 }, &.{square}, &.{square});
     }
 
     pub fn @"example: line spins"(core: *mach.Core) !void {
-        const input = [4]@Vector(8, u1){
-            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
-            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
-            .{ 0, 1, 0, 0, 0, 0, 0, 0 },
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        const input = Tile{
+            0b01000000,
+            0b01000000,
+            0b01000000,
+            0b00000000,
         };
-        const output = [4]@Vector(8, u1){
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .{ 1, 1, 1, 0, 0, 0, 0, 0 },
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        const output = Tile{
+            0b00000000,
+            0b11100000,
+            0b00000000,
+            0b00000000,
         };
         try expectGrid(core, .{ 1, 1 }, &.{input}, &.{output});
+    }
+
+    pub fn @"example: full 8x4 grid"(core: *mach.Core) !void {
+        const input = Tile{
+            0b11111111,
+            0b11111111,
+            0b11111111,
+            0b11111111,
+        };
+        const output = Tile{
+            0b10000001,
+            0b00000000,
+            0b00000000,
+            0b10000001,
+        };
+        try expectGrid(core, .{ 1, 1 }, &.{output}, &.{input});
     }
 
     pub fn @"webgpu impl matches reference"(core: *mach.Core) !void {
@@ -255,8 +288,8 @@ pub const tests = struct {
 
         // Choose a random size
         const size_tiles = @Vector(2, u32){
-            random.intRangeAtMost(u32, 1, 100),
-            random.intRangeAtMost(u32, 1, 200),
+            random.intRangeAtMost(u32, 1, 3),
+            random.intRangeAtMost(u32, 1, 3),
         };
         const size = size_tiles * TILE_SIZE;
 
@@ -337,7 +370,6 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
         core.device.getQueue().submit(&.{commands});
         commands.release();
 
-        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
         var ret_val: ?gpu.Buffer.MapAsyncStatus = null;
         var callback = gpu.Buffer.MapCallback.init(*?gpu.Buffer.MapAsyncStatus, &ret_val, setStatusPtrCallback);
         download.mapAsync(.read, 0, download_bytes_per_row * size_tiles[1], &callback);
@@ -348,7 +380,6 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
                 break;
             }
         }
-        std.debug.print("{s}:{} ret_val = {?}\n", .{ @src().fn_name, @src().line, ret_val });
         defer download.unmap();
         if (ret_val) |code| {
             switch (code) {
@@ -360,14 +391,41 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
             }
         }
 
-        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
+        var was_error = false;
         var y: u32 = 0;
         while (y < size_tiles[1]) : (y += 1) {
-            errdefer std.debug.print("y = {}\n\n", .{y});
+            errdefer {
+                std.debug.print("y = {}\n\n", .{y});
+            }
             const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]);
-            try std.testing.expectEqualSlices(Tile, tiles_expected[0..size_tiles[0]], tiles_row);
+            const expected = tiles_expected[y * size_tiles[0] ..][0..size_tiles[0]];
+            for (tiles_row) |tile, tile_idx| {
+                const expected_tile = expected[tile_idx];
+                if (!std.mem.eql(u8, &expected_tile, &tile)) {
+                    was_error = true;
+                    std.debug.print(
+                        \\At {{ {}, {} }}
+                        \\expected =
+                        \\
+                    , .{ tile_idx, y });
+                    for (expected_tile) |v| {
+                        std.debug.print("  {b:0>8}\n", .{v});
+                    }
+                    std.debug.print(
+                        \\
+                        \\actual =
+                        \\
+                    , .{});
+                    for (tile) |v| {
+                        std.debug.print("  {b:0>8}\n", .{v});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
         }
-        std.debug.print("{s}:{}\n", .{ @src().fn_name, @src().line });
+        if (was_error) {
+            return error.TestExpectedEqual;
+        }
     }
 }
 
