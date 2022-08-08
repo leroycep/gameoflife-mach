@@ -319,10 +319,8 @@ pub const tests = struct {
 };
 
 pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected: []const Tile, tiles_initial: []const Tile) !void {
-    const size = size_tiles * TILE_SIZE;
-
     var world: World = undefined;
-    try world.init(core, size);
+    try world.init(core, size_tiles);
     try world.set(core, tiles_initial);
 
     {
