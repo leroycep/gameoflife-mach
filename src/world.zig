@@ -4,9 +4,9 @@ const gpu = @import("gpu");
 
 texture_size: @Vector(2, u32),
 generations: u64,
-compute_pipeline: gpu.ComputePipeline,
-cell_textures: [2]gpu.Texture,
-cell_bind_groups: [2]gpu.BindGroup,
+compute_pipeline: *gpu.ComputePipeline,
+cell_textures: [2]*gpu.Texture,
+cell_bind_groups: [2]*gpu.BindGroup,
 
 const World = @This();
 
@@ -21,7 +21,7 @@ comptime {
 pub fn init(this: *@This(), core: *mach.Core, texture_size: @Vector(2, u32)) !void {
     const update_cells_shader_module = core.device.createShaderModule(&.{
         .label = "update cells shader module",
-        .code = .{ .wgsl = @embedFile("update_cells.wgsl") },
+        .next_in_chain = .{ .wgsl_descriptor = &.{ .source = @embedFile("update_cells.wgsl") } },
     });
 
     const compute_pipeline = core.device.createComputePipeline(&gpu.ComputePipeline.Descriptor{ .compute = gpu.ProgrammableStageDescriptor{
@@ -30,7 +30,7 @@ pub fn init(this: *@This(), core: *mach.Core, texture_size: @Vector(2, u32)) !vo
     } });
 
     // Create the buffers that will represent the cells
-    var cell_textures: [2]gpu.Texture = undefined;
+    var cell_textures: [2]*gpu.Texture = undefined;
     const cell_texture_size = gpu.Extent3D{
         .width = texture_size[0],
         .height = texture_size[1],
@@ -50,10 +50,11 @@ pub fn init(this: *@This(), core: *mach.Core, texture_size: @Vector(2, u32)) !vo
 
     // Create 2 bind groups. The first bind group is { cell_buffers[0], cell_buffers[1] }, and the second is { cell_buffers[1], cell_buffers[0] }.
     // This enables "double buffering" the cells when updating.
-    var cell_bind_groups: [2]gpu.BindGroup = undefined;
+    var cell_bind_groups: [2]*gpu.BindGroup = undefined;
     for (cell_bind_groups) |*bind_group, i| {
         bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
             .layout = compute_pipeline.getBindGroupLayout(0),
+            .entry_count = 2,
             .entries = &[_]gpu.BindGroup.Entry{
                 gpu.BindGroup.Entry.textureView(0, cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
                 gpu.BindGroup.Entry.textureView(1, cell_textures[(i + 1) % 2].createView(&gpu.TextureView.Descriptor{})),
@@ -110,7 +111,6 @@ pub fn set(this: *@This(), core: *mach.Core, src: []const Tile) !void {
             .rows_per_image = this.texture_size[1],
         },
         &texture_extents,
-        Tile,
         src,
     );
 }
@@ -141,11 +141,11 @@ pub fn get(this: *@This(), core: *mach.Core) void {
     download.mapAsync();
 }
 
-pub fn step(this: *@This(), command_encoder: gpu.CommandEncoder) !void {
+pub fn step(this: *@This(), command_encoder: *gpu.CommandEncoder) !void {
     const pass_encoder = command_encoder.beginComputePass(null);
     pass_encoder.setPipeline(this.compute_pipeline);
     pass_encoder.setBindGroup(0, this.cell_bind_groups[this.generations % 2], null);
-    pass_encoder.dispatch(this.texture_size[0], this.texture_size[1], 1);
+    pass_encoder.dispatchWorkgroups(this.texture_size[0], this.texture_size[1], 1);
     pass_encoder.end();
     pass_encoder.release();
     this.generations += 1;
@@ -369,8 +369,7 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
         commands.release();
 
         var ret_val: ?gpu.Buffer.MapAsyncStatus = null;
-        var callback = gpu.Buffer.MapCallback.init(*?gpu.Buffer.MapAsyncStatus, &ret_val, setStatusPtrCallback);
-        download.mapAsync(.read, 0, download_bytes_per_row * size_tiles[1], &callback);
+        download.mapAsync(.{ .read = true }, 0, download_bytes_per_row * size_tiles[1], &ret_val, setStatusPtrCallback);
         while (true) {
             if (ret_val == null) {
                 core.device.tick();
@@ -395,7 +394,7 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
             errdefer {
                 std.debug.print("y = {}\n\n", .{y});
             }
-            const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]);
+            const tiles_row = download.getConstMappedRange(Tile, y * download_bytes_per_row, size_tiles[0]) orelse @panic("less rows than expected");
             const expected = tiles_expected[y * size_tiles[0] ..][0..size_tiles[0]];
             for (tiles_row) |tile, tile_idx| {
                 const expected_tile = expected[tile_idx];
@@ -427,6 +426,6 @@ pub fn expectGrid(core: *mach.Core, size_tiles: @Vector(2, u32), tiles_expected:
     }
 }
 
-fn setStatusPtrCallback(status_ptr: *?gpu.Buffer.MapAsyncStatus, status: gpu.Buffer.MapAsyncStatus) void {
+inline fn setStatusPtrCallback(status_ptr: *?gpu.Buffer.MapAsyncStatus, status: gpu.Buffer.MapAsyncStatus) void {
     status_ptr.* = status;
 }

@@ -4,9 +4,9 @@ const gpu = @import("gpu");
 const World = @import("./world.zig");
 
 world: World,
-render_pipeline: gpu.RenderPipeline,
-sprite_vertex_buffer: gpu.Buffer,
-render_bind_groups: [2]gpu.BindGroup,
+render_pipeline: *gpu.RenderPipeline,
+sprite_vertex_buffer: *gpu.Buffer,
+render_bind_groups: [2]*gpu.BindGroup,
 frame_counter: usize,
 
 pub const App = @This();
@@ -35,7 +35,7 @@ pub fn init(app: *App, core: *mach.Core) !void {
 
     const sprite_shader_module = core.device.createShaderModule(&.{
         .label = "render cells shader module",
-        .code = .{ .wgsl = @embedFile("render_cells.wgsl") },
+        .next_in_chain = .{ .wgsl_descriptor = &.{ .source = @embedFile("render_cells.wgsl") } },
     });
 
     const vertex_buffer_attributes = [_]gpu.VertexAttribute{
@@ -51,6 +51,7 @@ pub fn init(app: *App, core: *mach.Core) !void {
         .vertex = .{
             .module = sprite_shader_module,
             .entry_point = "vert_main",
+            .buffer_count = 1,
             .buffers = &[_]gpu.VertexBufferLayout{
                 .{
                     // vertex buffer
@@ -61,11 +62,14 @@ pub fn init(app: *App, core: *mach.Core) !void {
                 },
             },
         },
-        .fragment = &gpu.FragmentState{ .module = sprite_shader_module, .entry_point = "frag_main", .targets = &[_]gpu.ColorTargetState{
-            .{
-                .format = core.swap_chain_format,
+        .fragment = &gpu.FragmentState{
+            .module = sprite_shader_module,
+            .entry_point = "frag_main",
+            .target_count = 1,
+            .targets = &[_]gpu.ColorTargetState{
+                .{ .format = core.swap_chain_format },
             },
-        } },
+        },
     });
 
     const vert_buffer_data = [_]f32{
@@ -79,15 +83,18 @@ pub fn init(app: *App, core: *mach.Core) !void {
     };
 
     const sprite_vertex_buffer = core.device.createBuffer(&gpu.Buffer.Descriptor{
+        .label = "screen_rect_vertex_buffer",
         .usage = .{ .vertex = true, .copy_dst = true },
         .size = vert_buffer_data.len * @sizeOf(f32),
     });
-    core.device.getQueue().writeBuffer(sprite_vertex_buffer, 0, f32, &vert_buffer_data);
+    core.device.getQueue().writeBuffer(sprite_vertex_buffer, 0, &vert_buffer_data);
 
-    var render_bind_groups: [2]gpu.BindGroup = undefined;
+    var render_bind_groups: [2]*gpu.BindGroup = undefined;
     for (render_bind_groups) |*bind_group, i| {
         bind_group.* = core.device.createBindGroup(&gpu.BindGroup.Descriptor{
+            .label = if (i == 0) "cells_render_bindgroup0" else "cells_render_bindgroup1",
             .layout = render_pipeline.getBindGroupLayout(0),
+            .entry_count = 1,
             .entries = &[_]gpu.BindGroup.Entry{
                 gpu.BindGroup.Entry.textureView(0, world.cell_textures[i].createView(&gpu.TextureView.Descriptor{})),
             },
@@ -115,9 +122,10 @@ pub fn update(app: *App, core: *mach.Core) !void {
         .store_op = .store,
     };
 
-    const render_pass_descriptor = gpu.RenderPassEncoder.Descriptor{ .color_attachments = &[_]gpu.RenderPassColorAttachment{
-        color_attachment,
-    } };
+    const render_pass_descriptor = gpu.RenderPassDescriptor{
+        .color_attachment_count = 1,
+        .color_attachments = &[_]gpu.RenderPassColorAttachment{color_attachment},
+    };
 
     const command_encoder = core.device.createCommandEncoder(null);
     try app.world.step(command_encoder);
